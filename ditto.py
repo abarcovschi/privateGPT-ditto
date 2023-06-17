@@ -89,7 +89,8 @@ def main():
         memory=memory,
     )
     
-
+    # enter this in the debug console to check the agent's prompt:
+    # agent.agent.llm_chain.prompt.template
     response = agent("hello how are you?")
 
 
