@@ -7,10 +7,15 @@ from langchain import PromptTemplate
 from langchain.chains import ConversationChain
 from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
 from langchain.chains.conversation.memory import ConversationBufferWindowMemory
-from langchain.agents import Tool, initialize_agent, AgentType, AgentExecutor
-from prompts import SUFFIX, FORMAT_INSTRUCTIONS, PREFIX
+from langchain.agents import Tool, initialize_agent, AgentType, ConversationalAgent
+from prompts import SUFFIX, FORMAT_INSTRUCTIONS, PREFIX, TEST_TEMPLATE
 from tools.circ_tool import CircumferenceTool
-
+from langchain.agents import Tool, AgentExecutor, LLMSingleActionAgent, AgentOutputParser
+from langchain.prompts import StringPromptTemplate
+from langchain import OpenAI, SerpAPIWrapper, LLMChain
+from typing import List, Union
+from langchain.schema import AgentAction, AgentFinish
+import re
 
 
 def hf_llm():
@@ -33,6 +38,50 @@ def hf_llm():
 
     return llm
 
+class CustomOutputParser(AgentOutputParser):
+
+    def parse(self, llm_output: str) -> Union[AgentAction, AgentFinish]:
+        # Check if agent should finish
+        if "Final Answer:" in llm_output:
+            return AgentFinish(
+                # Return values is generally always a dictionary with a single `output` key
+                # It is not recommended to try anything else at the moment :)
+                return_values={"output": llm_output.split("Final Answer:")[-1].strip()},
+                log=llm_output,
+            )
+        # Parse out the action and action input
+        regex = r"Action\s*\d*\s*:(.*?)\nAction\s*\d*\s*Input\s*\d*\s*:[\s]*(.*)\nObservation\s*\d*\s*:(.*?)"
+        match = re.search(regex, llm_output, re.DOTALL)
+        if not match:
+            raise ValueError(f"HELLO Could not parse LLM output: `{llm_output}`")
+        action = match.group(1).strip()
+        action_input = match.group(2)
+        # Return the action and action input
+        return AgentAction(tool=action, tool_input=action_input.strip(" ").strip('"'), log=llm_output)
+
+# Set up a prompt template
+class CustomPromptTemplate(StringPromptTemplate):
+    # The template to use
+    template: str
+    # The list of tools available
+    tools: List[Tool]
+
+    def format(self, **kwargs) -> str:
+        # Get the intermediate steps (AgentAction, Observation tuples)
+        # Format them in a particular way
+        intermediate_steps = kwargs.pop("intermediate_steps")
+        thoughts = ""
+        for action, observation in intermediate_steps:
+            thoughts += action.log
+            thoughts += f"\nObservation: {observation}\nThought: "
+        # Set the agent_scratchpad variable to that value
+        kwargs["agent_scratchpad"] = thoughts
+        # Create a tools variable from the list of tools provided
+        kwargs["tools"] = "\n".join([f"{tool.name}: {tool.description}" for tool in self.tools])
+        # Create a list of tool names for the tools provided
+        kwargs["tool_names"] = ", ".join([tool.name for tool in self.tools])
+        return self.template.format(**kwargs)
+
 def main():
     args = parse_arguments()
 
@@ -52,42 +101,67 @@ def main():
         temp=0.5
     )
 
+   
+
     # setup memory
     memory = ConversationBufferWindowMemory(
         memory_key='chat_history',
+        input_key="input",
         k=5,
-        return_messages=True
+        return_messages=True,   
     )
 
+
+    
+
     # setup tools for agent
+    # initialize the conversational tool
     convchain_bufw = ConversationChain(
-        llm=llm, 
+        llm=llm,
         verbose=True
     )
-    # initialize the conversational tool
     conv_tool = Tool(
         name='Conversation',
         func=convchain_bufw.run,
         description='Useful for conversational topics that do not require specific knowledge.',
         return_direct=True
     )
-
     tools = [conv_tool]
 
+        # setup custom prompt template
+    prompt = CustomPromptTemplate(
+        template=TEST_TEMPLATE,
+        tools=tools,
+        # This omits the `agent_scratchpad`, `tools`, and `tool_names` variables because those are generated dynamically
+        # This includes the `intermediate_steps` variable because that is needed
+        input_variables=["input", "intermediate_steps"]
+    )
+    convchain_bufw.prompt = prompt
+
+
+    output_parser = CustomOutputParser()
+
+   
+
+    # agent_prompt = ConversationalAgent.create_prompt(
+    #     tools,
+    #     prefix=PREFIX,
+    #     suffix=SUFFIX,
+    #     format_instructions=FORMAT_INSTRUCTIONS,
+    #     input_variables=["input", "chat_history", "agent_scratchpad"],
+    # )
+   
 
     agent = initialize_agent(
         tools,
         llm,
         agent=AgentType.CONVERSATIONAL_REACT_DESCRIPTION,
-        agent_kwargs={
-            "prefix": PREFIX,
-            "suffix": SUFFIX,
-            "format_instructions": FORMAT_INSTRUCTIONS
-        },
         verbose=True,
         max_iterations=5,
         memory=memory,
     )
+    agent.agent.output_parser = output_parser
+
     
     # enter this in the debug console to check the agent's prompt:
     # agent.agent.llm_chain.prompt.template
